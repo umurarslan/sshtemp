@@ -1,0 +1,75 @@
+_# Nokia SR OS jump-host example (CLI) — two devices in one run
+_#
+_# 1) OPTIONAL, Check syntax only (${VAR} placeholders are not substituted):
+_#    sshtemp --check examples/03-other-jumpserver-nokia_sros-cli.txt
+_#
+_# 2) Run (substitutes ${VAR} from the environment; prompts if missing):
+_#    export JUMP_PASSWORD=clab
+_#    export DEVICE_PASSWORD=NokiaSros1!
+_#    sshtemp examples/03-other-jumpserver-nokia_sros-cli.txt
+_#
+
+
+_# --- 10.100.100.3 DEVICE CONNECTION ---
+_HOST: 172.29.112.112
+_USERNAME: clab
+_PASSWORD: ${JUMP_PASSWORD}
+_PORT: 2222
+_EXPECT: #\s*$
+_LOGID: 10.100.100.3
+
+_IF: continue connecting
+_THEN: yes
+_IF: .*assword:
+_THEN: ${DEVICE_PASSWORD}
+
+ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null admin@10.100.100.3
+
+environment no more
+_CAPTURE:show_version_all_nodes.txt
+show version
+_END
+
+_WAIT: 120
+_CAPTURE:BACKUP_CONFIGS/backup_config_10.100.100.3.txt
+admin display-config
+_END
+
+_ERROR:(?i)(critical:|error:|minor:|major:)
+configure
+    port 1/4/8
+        description "lab test"
+exit all
+_ERROR:
+
+_# --- 10.100.100.4 DEVICE CONNECTION ---
+_HOST: 172.29.112.112
+_USERNAME: clab
+_PASSWORD: ${JUMP_PASSWORD}
+_PORT: 2222
+_EXPECT: #\s*$
+_LOGID: 10.100.100.4
+
+_IF: continue connecting
+_THEN: yes
+_IF: .*assword:
+_THEN: ${DEVICE_PASSWORD}
+
+ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null admin@10.100.100.4
+
+environment no more
+_CAPTURE:show_version_all_nodes.txt
+show version
+_END
+
+_WAIT: 120
+_CAPTURE:BACKUP_CONFIGS/backup_config_10.100.100.4.txt
+admin display-config
+_END
+
+_ERROR:(?i)(critical:|error:|minor:|major:)
+configure
+    port 1/4/8
+        description "lab test"
+exit all
+_ERROR:

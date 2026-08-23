@@ -1,0 +1,26 @@
+_# Basic Nokia SR OS example (CLI) — one device
+_#
+_# 1) OPTIONAL, Check syntax only:
+_#    sshtemp --check examples/01-basic-nokia_sros-cli.txt
+_#
+_# 2) Run:
+_#    sshtemp examples/01-basic-nokia_sros-cli.txt
+_#
+
+
+_HOST: 10.100.100.3
+_USERNAME: admin
+_PASSWORD: NokiaSros1!
+
+_EXPECT: #\s*$
+
+_CAPTURE:show_version
+show version
+_END
+
+_ERROR:(?i)(critical:|error:|minor:|major:)
+configure
+    port 1/4/8
+        description "lab test"
+exit all
+_ERROR:

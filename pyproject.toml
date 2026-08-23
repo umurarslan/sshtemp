@@ -1,0 +1,17 @@
+[project]
+name = "sshtemp"
+version = "2026.8.1"
+requires-python = ">=3.11"
+dependencies = [
+    "paramiko>=5.0.0",
+]
+
+[project.scripts]
+sshtemp = "sshtemp.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sshtemp"]
