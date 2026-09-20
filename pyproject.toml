@@ -1,9 +1,25 @@
 [project]
 name = "sshtemp"
-version = "2026.8.1"
+version = "2026.9.1"
+description = "Template-driven SSH automation using Paramiko invoke_shell"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Umur ARSLAN", email = "umurarslan@gmail.com" }]
 requires-python = ">=3.11"
 dependencies = [
-    "paramiko>=5.0.0",
+    "paramiko>=3.0,<6",
+]
+keywords = ["ssh", "paramiko", "network", "automation", "template", "cli"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
 ]
 
 [project.scripts]

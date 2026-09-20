@@ -12,10 +12,11 @@ class SshTempCapture:
 class SshTempRunContext:
     host: str | None = None
     log_id: str | None = None
-    active_capture_name: str | None = None
     verbose: bool = False
     host_key_policy: str = "auto"
     warnings: list[str] = field(default_factory=list)
+    partial_capture: SshTempCapture | None = None
+    last_recv_text: str = ""
 
 
 @dataclass

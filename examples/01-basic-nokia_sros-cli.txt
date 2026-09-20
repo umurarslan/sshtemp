@@ -14,7 +14,7 @@ _PASSWORD: NokiaSros1!
 
 _EXPECT: #\s*$
 
-_CAPTURE:show_version
+_CAPTURE:show_version.txt
 show version
 _END
 

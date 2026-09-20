@@ -4,14 +4,14 @@ Basic Nokia SR OS — one device, show version and configuration.
 
 from sshtemp import ssht
 
-TEMPLATE = """
+TEMPLATE = r"""
 _HOST: 10.100.100.3
 _USERNAME: admin
 _PASSWORD: NokiaSros1!
 
 _EXPECT: #\s*$
 
-_CAPTURE:show_version
+_CAPTURE:show_version.txt
 show version
 _END
 
@@ -28,5 +28,7 @@ result = ssht(TEMPLATE)
 if not result.success:
     print("unsuccessful:", result.error)
 else:
-    print(result.captures["show_version"])
-    print(result.warnings)
+    print(result.captures["show_version.txt"])
+
+for warning in result.warnings:
+    print(f"warning: {warning}")

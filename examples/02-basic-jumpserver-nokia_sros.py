@@ -4,7 +4,7 @@ Basic Nokia SR OS with jump server example — one device, show version and conf
 
 from sshtemp import ssht
 
-TEMPLATE = """
+TEMPLATE = r"""
 _HOST: 172.29.112.112
 _USERNAME: clab
 _PASSWORD: clab
@@ -19,7 +19,7 @@ NokiaSros1!
 
 environment no more
 
-_CAPTURE:show_version
+_CAPTURE:show_version.txt
 show version
 _END
 
@@ -30,7 +30,7 @@ configure
 exit all
 _ERROR:
 
-_CAPTURE:show_port_description
+_CAPTURE:show_port_description.txt
 show port 1/4/8 description
 _END
 
@@ -41,6 +41,8 @@ result = ssht(TEMPLATE)
 if not result.success:
     print("unsuccessful:", result.error)
 else:
-    print(result.captures["show_version"])
-    print(result.captures["show_port_description"])
-    print(result.warnings)
+    print(result.captures["show_version.txt"])
+    print(result.captures["show_port_description.txt"])
+
+for warning in result.warnings:
+    print(f"warning: {warning}")

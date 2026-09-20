@@ -3,7 +3,7 @@
 Used internally by ``ssht_parallel()`` before workers start. Single ``ssht()`` is unchanged.
 """
 
-from __future__ import annotations
+from sshtemp.validator import parse_directive
 
 STICKY_INJECT_ORDER: tuple[str, ...] = (
     "USERNAME",
@@ -11,6 +11,7 @@ STICKY_INJECT_ORDER: tuple[str, ...] = (
     "PORT",
     "TIMEOUT",
     "SHELL",
+    "SETTLE",
     "RECV_BUFFER",
     "ENCODING",
     "EXPECT",
@@ -171,9 +172,13 @@ def _validate_section_capture_closed(
     for line_number, line in enumerate(section_lines, start=1):
         if not line.strip():
             continue
-        if line.startswith(directive_prefix + "#"):
+        parsed = parse_directive(line, directive_prefix)
+        if parsed is None:
             continue
-        if line.startswith(directive_prefix + "CAPTURE"):
+        name, _ = parsed
+        if name == "#":
+            continue
+        if name == "CAPTURE":
             if capturing:
                 raise TemplateSectionsError(
                     f"section {section_number} line {line_number}: nested "
@@ -181,7 +186,7 @@ def _validate_section_capture_closed(
                 )
             capturing = True
             continue
-        if line.startswith(directive_prefix + "END"):
+        if name == "END":
             if not capturing:
                 raise TemplateSectionsError(
                     f"section {section_number} line {line_number}: "

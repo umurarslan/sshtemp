@@ -17,13 +17,13 @@ def main() -> None:
 
     sections = []
     for device in DEVICES:
-        sections.append(f"""
+        sections.append(rf"""
 _# --- {device} DEVICE CONNECTION ---
 _HOST: 172.29.112.112
 _USERNAME: clab
 _PASSWORD: {jump_password}
 _PORT: 2222
-_EXPECT: #\\s*$
+_EXPECT: #\s*$
 _LOGID: {device}
 
 _IF: continue connecting
@@ -48,12 +48,13 @@ _END
         print("unsuccessful:", result.error)
         if result.failed_section_index is not None:
             failed = result.results[result.failed_section_index]
-            print(f"section {result.failed_section_index} ({failed.log_id}):", failed.error)
+            section_number = result.failed_section_index + 1
+            print(f"section {section_number} ({failed.log_id}):", failed.error)
     else:
         print("output:", result.output_dir)
 
     for index, section_result in enumerate(result.results):
-        label = section_result.log_id or section_result.host or f"section {index}"
+        label = section_result.log_id or section_result.host or f"section {index + 1}"
         for warning in section_result.warnings:
             print(f"[{label}] warning: {warning}")
 

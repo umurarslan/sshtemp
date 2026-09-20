@@ -128,6 +128,14 @@ class ExpandTemplateSectionsTests(unittest.TestCase):
         self.assertIn("_RECV_BUFFER: 32768", section_two)
         self.assertIn("_ENCODING: utf-8", section_two)
 
+    def test_injects_settle(self):
+        sections = [
+            "_HOST: 10.0.0.1\n_SETTLE: 8\n_USERNAME: admin",
+            "_HOST: 10.0.0.2\nshow version",
+        ]
+        expanded = expand_template_sections(sections)
+        self.assertIn("_SETTLE: 8", expanded[1])
+
     def test_rejects_unclosed_capture_in_section(self):
         sections = [
             "_HOST: 10.0.0.1\n_USERNAME: admin",

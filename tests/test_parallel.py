@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -22,6 +23,15 @@ class SshtParallelTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.results, [])
         self.assertIn("not found", result.error or "")
+
+    def test_unreadable_template_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "bad.txt"
+            template.write_bytes(b"\xff\xfe")
+            result = ssht_parallel(template, max_workers=1)
+        self.assertFalse(result.success)
+        self.assertEqual(result.results, [])
+        self.assertIn("failed to read template", result.error or "")
 
     def test_prep_error_returns_without_workers(self):
         template = """
@@ -156,6 +166,32 @@ _HOST: 10.0.0.3
             [item.host for item in result.results],
             ["10.0.0.1", "10.0.0.2", "10.0.0.3"],
         )
+
+    @patch("sshtemp.parallel.ssht")
+    @patch("sshtemp.parallel.configure_logging")
+    @patch("sshtemp.parallel._prepare_output_dir")
+    def test_prepare_output_oserror_returns_error(
+        self,
+        mock_prepare,
+        mock_configure_logging,
+        mock_ssht,
+    ):
+        mock_prepare.side_effect = OSError("disk full")
+        template = """
+_HOST: 10.0.0.1
+_USERNAME: admin
+"""
+        result = ssht_parallel(
+            template.strip(),
+            max_workers=1,
+            save_to_disk=True,
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.results, [])
+        self.assertIn("failed to write output", result.error or "")
+        self.assertIn("disk full", result.error or "")
+        mock_ssht.assert_not_called()
+        mock_configure_logging.assert_not_called()
 
 
 if __name__ == "__main__":

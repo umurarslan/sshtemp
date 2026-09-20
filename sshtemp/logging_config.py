@@ -5,6 +5,8 @@ from pathlib import Path
 
 LOG_FILE_NAME = "sshtemp.log"
 
+# Allowlist: only these ``extra=`` keys reach the log line. A new field must be
+# added here to appear, which also keeps unexpected session data out of logs.
 _LOG_EXTRA_FIELDS = (
     "log_id",
     "host",
@@ -25,7 +27,8 @@ _LOG_EXTRA_FIELDS = (
 
 _SENSITIVE_EXTRA_FIELDS = frozenset({"password", "then_response", "secret"})
 
-_log_file_append = False
+_LOGGER_NAME = "sshtemp"
+_OWNED_HANDLER_FLAG = "_sshtemp_owned"
 _logging_lock = threading.Lock()
 
 
@@ -64,52 +67,59 @@ class SshTempFormatter(logging.Formatter):
         return line
 
 
+def _mark_owned(handler: logging.Handler) -> logging.Handler:
+    setattr(handler, _OWNED_HANDLER_FLAG, True)
+    return handler
+
+
+def _remove_owned_handlers(logger: logging.Logger) -> None:
+    for handler in logger.handlers[:]:
+        if getattr(handler, _OWNED_HANDLER_FLAG, False):
+            logger.removeHandler(handler)
+            handler.close()
+
+
 def configure_logging(
     *,
     verbose: bool = False,
     log_file: str | Path | None = None,
-    append: bool | None = None,
-) -> Path:
-    """Configure sshtemp logging to console and a log file."""
-    global _log_file_append
+    append: bool = False,
+) -> None:
+    """Send sshtemp logs to stderr, plus *log_file* when a path is given.
 
+    Handlers added by the calling application are left in place; only handlers
+    created here are replaced, so repeated calls do not stack up.
+    """
     with _logging_lock:
-        log_path = Path(log_file or LOG_FILE_NAME)
-        if append is None:
-            append = _log_file_append
+        level = logging.INFO if verbose else logging.WARNING
 
-        console_level = logging.INFO if verbose else logging.WARNING
-        file_level = logging.INFO if verbose else logging.WARNING
+        logger = logging.getLogger(_LOGGER_NAME)
+        logger.setLevel(logging.DEBUG)
+        _remove_owned_handlers(logger)
 
-        file_handler = logging.FileHandler(
-            log_path,
-            mode="a" if append else "w",
-            encoding="utf-8",
-        )
-        file_handler.setFormatter(SshTempFormatter(include_timestamp=True))
-        file_handler.setLevel(file_level)
-
-        stream_handler = logging.StreamHandler()
+        stream_handler = _mark_owned(logging.StreamHandler())
         stream_handler.setFormatter(SshTempFormatter(include_timestamp=False))
-        stream_handler.setLevel(console_level)
+        stream_handler.setLevel(level)
+        logger.addHandler(stream_handler)
 
-        root_logger = logging.getLogger("sshtemp")
-        root_logger.setLevel(logging.DEBUG)
-        for handler in root_logger.handlers[:]:
-            handler.close()
-            root_logger.removeHandler(handler)
-        root_logger.addHandler(file_handler)
-        root_logger.addHandler(stream_handler)
-        root_logger.propagate = False
+        if log_file is not None:
+            file_handler = _mark_owned(
+                logging.FileHandler(
+                    Path(log_file),
+                    mode="a" if append else "w",
+                    encoding="utf-8",
+                )
+            )
+            file_handler.setFormatter(SshTempFormatter(include_timestamp=True))
+            file_handler.setLevel(level)
+            logger.addHandler(file_handler)
 
-        _log_file_append = True
-        return log_path
+        # The stderr handler above already prints every record; propagating would
+        # print each line a second time through the root logger.
+        logger.propagate = False
 
 
 def shutdown_logging() -> None:
-    """Close sshtemp log handlers so log files can be deleted (e.g. in tests)."""
+    """Close the handlers sshtemp added, so a log file can be deleted or moved."""
     with _logging_lock:
-        root_logger = logging.getLogger("sshtemp")
-        for handler in root_logger.handlers[:]:
-            handler.close()
-            root_logger.removeHandler(handler)
+        _remove_owned_handlers(logging.getLogger(_LOGGER_NAME))

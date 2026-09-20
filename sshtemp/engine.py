@@ -1,8 +1,10 @@
 import logging
 import os
 import re
+import socket
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +22,8 @@ from sshtemp.logging_config import LOG_FILE_NAME, configure_logging, shutdown_lo
 from sshtemp.models import SshTempCapture, SshTempResult, SshTempRunContext
 from sshtemp.validator import (
     DEFAULT_WAIT_SECONDS,
+    is_directive_line,
+    parse_directive,
     parse_encoding,
     parse_shell_size,
     validate_directive_prefix,
@@ -33,7 +37,12 @@ DEFAULT_SHELL_WIDTH = 240
 DEFAULT_SHELL_HEIGHT = 72
 DEFAULT_RECV_BUFFER = 65535
 DEFAULT_RECV_ENCODING = "utf-8"
+DEFAULT_CONNECT_TIMEOUT = 10
+DEFAULT_RETRY_COUNT = 1
 KEEPALIVE_INTERVAL = 60
+# After invoke_shell, wait this long for the first login byte (and again for
+# silence after MOTD). Quiet devices proceed; they do not fail the run.
+LOGIN_SETTLE_SECONDS = 2.0
 DEFAULT_HOST_KEY_POLICY = "auto"
 HOST_KEY_POLICIES = frozenset({"auto", "reject"})
 _capture_file_lock = threading.Lock()
@@ -53,6 +62,10 @@ def _display_command(command: str) -> str:
 
 def _format_validation_error(issues: list[str]) -> str:
     return "template validation failed:\n" + "\n".join(issues)
+
+
+def _format_write_error(exc: OSError) -> str:
+    return f"failed to write output: {exc}"
 
 
 def _normalize_host_key_policy(value: str) -> str:
@@ -126,12 +139,69 @@ def _record_warning(
     )
 
 
+@dataclass
+class _PollOutcome:
+    recv_text: str
+    had_error: bool = False
+    channel_closed: bool = False
+
+
+def _session_closed(session) -> bool:
+    """True when the SSH channel is actually closed (not a mock/placeholder object)."""
+    if getattr(session, "closed", False) is True:
+        return True
+    checker = getattr(session, "exit_status_ready", None)
+    if not callable(checker):
+        return False
+    return checker() is True
+
+
+def _channel_timeout(session) -> float | None:
+    getter = getattr(session, "gettimeout", None)
+    if not callable(getter):
+        return None
+    return getter()
+
+
+def _set_channel_timeout(session, timeout: float | None) -> None:
+    setter = getattr(session, "settimeout", None)
+    if callable(setter):
+        setter(timeout)
+
+
+def _drain_ready(
+    session, recv_buffer: bytes, recv_buffer_size: int
+) -> tuple[bytes, bool]:
+    """Read already-buffered bytes without waiting. Returns (buffer, channel_closed)."""
+    while session.recv_ready():
+        extra = session.recv(recv_buffer_size)
+        if not extra:
+            return recv_buffer, True
+        recv_buffer += extra
+    return recv_buffer, False
+
+
+def _stash_open_capture(
+    context: SshTempRunContext,
+    *,
+    capturing: bool,
+    capture_name: str,
+    capture_buffer: str,
+) -> None:
+    if not capturing:
+        return
+    output = "\n".join((capture_buffer + context.last_recv_text).splitlines())
+    if not output:
+        return
+    context.partial_capture = SshTempCapture(name=capture_name, output=output)
+    context.last_recv_text = ""
+
+
 def _poll_command_output(
     session,
     *,
     host: str | None,
-    poll_expect_interval: float,
-    polls_left: int,
+    wait_seconds: float,
     current_if_rules: list[tuple[str, str]],
     responded: list[bool],
     expect_pattern: str,
@@ -143,21 +213,16 @@ def _poll_command_output(
     context: SshTempRunContext,
     recv_buffer_size: int,
     recv_encoding: str,
-) -> tuple[str, bool]:
-    """Poll shell output. Returns (recv_text, error_seen_without_fail)."""
+) -> _PollOutcome:
+    """Read shell output until expect matches, the channel closes, or *wait_seconds* elapse."""
     recv_buffer = b""
     recv_text = ""
     had_error = False
+    channel_closed = False
+    deadline = time.monotonic() + wait_seconds
 
-    while polls_left > 0:
-        time.sleep(poll_expect_interval)
-        polls_left -= 1
-        if not session.recv_ready():
-            continue
-
-        recv_buffer += session.recv(recv_buffer_size)
-        recv_text = recv_buffer.decode(recv_encoding, errors="ignore")
-
+    def _apply_output_hooks() -> bool:
+        nonlocal had_error
         for i, (if_pat, then_resp) in enumerate(current_if_rules):
             if not responded[i] and re.search(if_pat, recv_text):
                 session.send(then_resp + "\n")
@@ -184,6 +249,7 @@ def _poll_command_output(
                 f"{capture_part}, command {display_command!r}"
             )
             if error_fail == "on":
+                context.last_recv_text = recv_text
                 raise SshTempErrorPattern(
                     message,
                     host=host,
@@ -211,9 +277,146 @@ def _poll_command_output(
                         pattern=expect_pattern,
                     ),
                 )
+            return True
+        return False
+
+    while True:
+        recv_buffer, drained_closed = _drain_ready(
+            session, recv_buffer, recv_buffer_size
+        )
+        if drained_closed:
+            channel_closed = True
+        if recv_buffer:
+            recv_text = recv_buffer.decode(recv_encoding, errors="ignore")
+            if _apply_output_hooks():
+                return _PollOutcome(
+                    recv_text,
+                    had_error=had_error,
+                    channel_closed=channel_closed,
+                )
+        if channel_closed or _session_closed(session):
+            return _PollOutcome(
+                recv_text,
+                had_error=had_error,
+                channel_closed=True,
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             break
 
-    return recv_text, had_error
+        previous_timeout = _channel_timeout(session)
+        try:
+            _set_channel_timeout(session, remaining)
+            chunk = session.recv(recv_buffer_size)
+        except socket.timeout:
+            break
+        finally:
+            _set_channel_timeout(session, previous_timeout)
+
+        if not chunk:
+            channel_closed = True
+            continue
+
+        recv_buffer += chunk
+
+    return _PollOutcome(
+        recv_text,
+        had_error=had_error,
+        channel_closed=channel_closed,
+    )
+
+
+def _settle_login_output(
+    session,
+    *,
+    host: str | None,
+    wait_seconds: float,
+    idle_seconds: float,
+    expect_pattern: str,
+    line_number: int,
+    context: SshTempRunContext,
+    recv_buffer_size: int,
+    recv_encoding: str,
+) -> None:
+    """Read post-connect MOTD/prompt without sending a command. Never fails the run.
+
+    Stops when *_EXPECT* matches received text, the channel goes idle, the
+    channel closes, or *wait_seconds* elapse. *_ERROR* and *_IF* are not
+    applied, and the text is not captured. A device that prints nothing until
+    the first command hits the idle timeout and execution continues.
+    """
+    recv_buffer = b""
+    recv_text = ""
+    saw_data = False
+    deadline = time.monotonic() + wait_seconds
+    last_data_at = time.monotonic()
+
+    def _matched_expect() -> bool:
+        if not expect_pattern or not recv_text:
+            return False
+        if not re.search(expect_pattern, recv_text):
+            return False
+        if context.verbose:
+            logger.info(
+                "sshtemp.login_settled",
+                extra=_log_extra(
+                    host,
+                    log_id=context.log_id,
+                    template_line=line_number,
+                    pattern=expect_pattern,
+                    output_preview=_preview_output(recv_text),
+                ),
+            )
+        return True
+
+    while True:
+        previous_len = len(recv_buffer)
+        recv_buffer, drained_closed = _drain_ready(
+            session, recv_buffer, recv_buffer_size
+        )
+        if len(recv_buffer) > previous_len:
+            recv_text = recv_buffer.decode(recv_encoding, errors="ignore")
+            saw_data = True
+            last_data_at = time.monotonic()
+            if _matched_expect():
+                return
+        if drained_closed or _session_closed(session):
+            return
+
+        now = time.monotonic()
+        remaining_deadline = deadline - now
+        if remaining_deadline <= 0:
+            return
+
+        if saw_data:
+            idle_left = idle_seconds - (now - last_data_at)
+            if idle_left <= 0:
+                return
+            recv_timeout = min(remaining_deadline, idle_left)
+        else:
+            recv_timeout = min(remaining_deadline, idle_seconds)
+
+        if recv_timeout <= 0:
+            return
+
+        previous_timeout = _channel_timeout(session)
+        try:
+            _set_channel_timeout(session, recv_timeout)
+            chunk = session.recv(recv_buffer_size)
+        except socket.timeout:
+            return
+        finally:
+            _set_channel_timeout(session, previous_timeout)
+
+        if not chunk:
+            return
+        recv_buffer += chunk
+        recv_text = recv_buffer.decode(recv_encoding, errors="ignore")
+        saw_data = True
+        last_data_at = time.monotonic()
+        if _matched_expect():
+            return
 
 
 def _validate_or_raise(
@@ -250,10 +453,9 @@ def _ssh_temp(
 ):
     """Execute an SSH template and yield SshTempCapture objects."""
 
-    poll_expect_interval = 0.5
     default_wait_seconds = DEFAULT_WAIT_SECONDS
-    default_connect_timeout = 10
-    default_retry_count = 1
+    default_connect_timeout = DEFAULT_CONNECT_TIMEOUT
+    default_retry_count = DEFAULT_RETRY_COUNT
 
     run_context = context or SshTempRunContext()
 
@@ -294,6 +496,7 @@ def _ssh_temp(
     capture_leading_enter = False
     shell_width = DEFAULT_SHELL_WIDTH
     shell_height = DEFAULT_SHELL_HEIGHT
+    login_settle_seconds = LOGIN_SETTLE_SECONDS
     recv_buffer_size = DEFAULT_RECV_BUFFER
     recv_encoding = DEFAULT_RECV_ENCODING
     template_lines = command_temp_text.splitlines()
@@ -321,7 +524,12 @@ def _ssh_temp(
         for line_number, line in enumerate(template_lines, start=1):
             if not line.strip():
                 continue
-            elif line.startswith(directive_prefix + "#"):
+
+            parsed = parse_directive(line, directive_prefix)
+            name = parsed[0] if parsed is not None else None
+            raw = parsed[1] if parsed is not None else ""
+
+            if name == "#":
                 continue
 
             elif line.startswith(directive_prefix + "HOST:"):
@@ -364,6 +572,18 @@ def _ssh_temp(
                 except ValueError as exc:
                     raise SshTempTemplateError(
                         f"invalid {directive_prefix}SHELL at line {line_number}: {exc}",
+                        host=host,
+                        template_line=line_number,
+                    ) from exc
+                continue
+            elif line.startswith(directive_prefix + "SETTLE:"):
+                raw = line.removeprefix(directive_prefix + "SETTLE:").strip()
+                try:
+                    login_settle_seconds = max(0, int(raw))
+                except ValueError as exc:
+                    raise SshTempTemplateError(
+                        f"invalid {directive_prefix}SETTLE at line {line_number}: "
+                        f"must be an integer, got {raw!r}",
                         host=host,
                         template_line=line_number,
                     ) from exc
@@ -411,7 +631,7 @@ def _ssh_temp(
                 if_rules.append((pending_if, then_text))
                 pending_if = None
                 continue
-            elif line.startswith(directive_prefix + "ENTER"):
+            elif name == "ENTER":
                 line = ""
             elif line.startswith(directive_prefix + "EXPECT:"):
                 expect_pattern = line.removeprefix(directive_prefix + "EXPECT:").lstrip()
@@ -453,7 +673,7 @@ def _ssh_temp(
             elif line.startswith(directive_prefix + "SLEEP:"):
                 time.sleep(int(line.removeprefix(directive_prefix + "SLEEP:").strip()))
                 continue
-            elif line.startswith(directive_prefix + "CAPTURE"):
+            elif name == "CAPTURE":
                 if pending_wait is not None:
                     capture_block_wait = pending_wait
                     pending_wait = None
@@ -462,18 +682,13 @@ def _ssh_temp(
                     pending_retry = None
                 capturing = True
                 capture_leading_enter = True
-                capture_name = ""
-                run_context.active_capture_name = None
-                if line.startswith(directive_prefix + "CAPTURE:"):
-                    capture_name = line.removeprefix(directive_prefix + "CAPTURE:").strip()
-                    run_context.active_capture_name = capture_name
+                capture_name = raw.strip()
                 continue
-            elif line.startswith(directive_prefix + "END"):
+            elif name == "END":
                 if capturing:
                     capture_buffer_copy = capture_buffer
                     capturing = False
                     capture_buffer = ""
-                    run_context.active_capture_name = None
                     capture_block_wait = None
                     capture_block_retry = None
                     output = "\n".join(capture_buffer_copy.splitlines())
@@ -491,7 +706,7 @@ def _ssh_temp(
                     yield SshTempCapture(name=capture_name, output=output)
                 continue
 
-            if line.startswith(directive_prefix):
+            if parsed is not None and not is_directive_line(line, directive_prefix):
                 raise SshTempTemplateError(
                     f"unknown directive at line {line_number}: {line!r}",
                     host=host,
@@ -537,6 +752,20 @@ def _ssh_temp(
                         username=username,
                     ),
                 )
+                _settle_login_output(
+                    session,
+                    host=host,
+                    wait_seconds=max(
+                        float(default_wait_seconds),
+                        float(login_settle_seconds),
+                    ),
+                    idle_seconds=float(login_settle_seconds),
+                    expect_pattern=expect_pattern,
+                    line_number=line_number,
+                    context=run_context,
+                    recv_buffer_size=recv_buffer_size,
+                    recv_encoding=recv_encoding,
+                )
 
             wait_seconds, retry_count = _consume_command_timing()
 
@@ -581,13 +810,10 @@ def _ssh_temp(
                 attempt_number += 1
                 attempts_left -= 1
                 session.send(line + "\n")
-                polls_left = max(1, int(wait_seconds / poll_expect_interval))
-
-                recv_text, _had_error = _poll_command_output(
+                outcome = _poll_command_output(
                     session,
                     host=host,
-                    poll_expect_interval=poll_expect_interval,
-                    polls_left=polls_left,
+                    wait_seconds=wait_seconds,
                     current_if_rules=current_if_rules,
                     responded=responded,
                     expect_pattern=expect_pattern,
@@ -600,8 +826,27 @@ def _ssh_temp(
                     recv_buffer_size=recv_buffer_size,
                     recv_encoding=recv_encoding,
                 )
+                recv_text = outcome.recv_text
+                if capturing:
+                    capture_buffer += recv_text
 
                 if expect_pattern and re.search(expect_pattern, recv_text):
+                    break
+
+                if outcome.channel_closed:
+                    if expect_pattern:
+                        capture_part = (
+                            f", capture {active_capture!r}" if active_capture else ""
+                        )
+                        raise SshTempTimeoutError(
+                            f'channel closed before expect pattern "{expect_pattern}" '
+                            f"matched at line {line_number}{capture_part}, "
+                            f"command {display_command!r}",
+                            host=host,
+                            template_line=line_number,
+                            command=display_command,
+                            capture_name=active_capture,
+                        )
                     break
 
                 if expect_pattern and attempts_left > 0:
@@ -654,12 +899,15 @@ def _ssh_temp(
                     )
                 break
 
-            if capturing:
-                capture_buffer += recv_text
-
         return None
 
     except SshTempError as exc:
+        _stash_open_capture(
+            run_context,
+            capturing=capturing,
+            capture_name=capture_name,
+            capture_buffer=capture_buffer,
+        )
         logger.error(
             "sshtemp.run_failed",
             extra=_log_extra(
@@ -674,6 +922,12 @@ def _ssh_temp(
         raise
 
     except Exception as exc:
+        _stash_open_capture(
+            run_context,
+            capturing=capturing,
+            capture_name=capture_name,
+            capture_buffer=capture_buffer,
+        )
         logger.exception(
             "sshtemp.unexpected_error",
             extra=_log_extra(host, log_id=run_context.log_id),
@@ -744,8 +998,67 @@ def _merge_capture(captures: dict[str, str], name: str, output: str) -> None:
         captures[name] = output
 
 
+def _assign_capture_name(raw_name: str, unnamed_index: int) -> tuple[str, int]:
+    name = raw_name.strip()
+    if not name:
+        name = f"capture_{unnamed_index}.txt"
+        unnamed_index += 1
+    return name, unnamed_index
+
+
+def _commit_partial_capture(
+    context: SshTempRunContext,
+    captures: dict[str, str],
+    unnamed_index: int,
+    *,
+    save_to_disk: bool,
+    out_dir: Path | None,
+) -> int:
+    item = context.partial_capture
+    if item is None:
+        return unnamed_index
+    name, unnamed_index = _assign_capture_name(item.name, unnamed_index)
+    _merge_capture(captures, name, item.output)
+    if save_to_disk and out_dir is not None:
+        try:
+            _append_capture_file(_resolve_capture_path(out_dir, name), item.output)
+        except (OSError, ValueError) as exc:
+            _record_warning(
+                context,
+                f"failed to write partial capture {name!r}: {exc}",
+                host=context.host,
+            )
+    _record_warning(
+        context,
+        f"capture {name!r} saved partially (run failed before _END)",
+        host=context.host,
+    )
+    return unnamed_index
+
+
 def _is_inline_template(text: str) -> bool:
     return "\n" in text or "\r" in text
+
+
+def _read_template_file(path: Path) -> tuple[str | None, str | None]:
+    try:
+        if not path.is_file():
+            return None, f"template file not found: {path}"
+        return path.read_text(encoding="utf-8"), None
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"failed to read template: {exc}"
+
+
+def _log_template_load_error(load_error: str, log_id: str | None) -> None:
+    event = (
+        "sshtemp.template_not_found"
+        if load_error.startswith("template file not found")
+        else "sshtemp.template_read_error"
+    )
+    logger.error(
+        event,
+        extra=_log_extra(log_id=log_id, error=load_error),
+    )
 
 
 def _resolve_template_text(
@@ -757,18 +1070,13 @@ def _resolve_template_text(
     ``Path`` is accepted for tests and internal callers.
     """
     if isinstance(command_temp_text, Path):
-        if not command_temp_text.is_file():
-            return None, f"template file not found: {command_temp_text}"
-        return command_temp_text.read_text(encoding="utf-8"), None
+        return _read_template_file(command_temp_text)
 
     text = command_temp_text
     if _is_inline_template(text):
         return text, None
 
-    path = Path(text.strip())
-    if not path.is_file():
-        return None, f"template file not found: {text.strip()}"
-    return path.read_text(encoding="utf-8"), None
+    return _read_template_file(Path(text.strip()))
 
 
 def ssht(
@@ -797,17 +1105,27 @@ def ssht(
     template_text, load_error = _resolve_template_text(command_temp_text)
     if load_error:
         if save_to_disk:
-            out_dir = _prepare_output_dir(output_dir)
-            if manage_logging:
-                configure_logging(
-                    verbose=verbose,
-                    log_file=out_dir / LOG_FILE_NAME,
-                    append=False,
+            try:
+                out_dir = _prepare_output_dir(output_dir)
+                if manage_logging:
+                    configure_logging(
+                        verbose=verbose,
+                        log_file=out_dir / LOG_FILE_NAME,
+                        append=False,
+                    )
+            except OSError as exc:
+                logger.error(
+                    "sshtemp.output_write_error",
+                    extra=_log_extra(log_id=log_id, error=str(exc)),
                 )
-            logger.error(
-                "sshtemp.template_not_found",
-                extra=_log_extra(log_id=log_id, error=load_error),
-            )
+                if manage_logging:
+                    shutdown_logging()
+                return SshTempResult(
+                    success=False,
+                    log_id=log_id,
+                    error=_format_write_error(exc),
+                )
+            _log_template_load_error(load_error, log_id)
             result = SshTempResult(
                 success=False,
                 output_dir=out_dir,
@@ -819,25 +1137,36 @@ def ssht(
             return result
         if manage_logging:
             configure_logging(verbose=verbose)
-        logger.error(
-            "sshtemp.template_not_found",
-            extra=_log_extra(log_id=log_id, error=load_error),
-        )
+        _log_template_load_error(load_error, log_id)
         return SshTempResult(success=False, log_id=log_id, error=load_error)
 
     out_dir: Path | None = None
-    if manage_logging:
-        if save_to_disk:
+    try:
+        if manage_logging:
+            if save_to_disk:
+                out_dir = _prepare_output_dir(output_dir)
+                configure_logging(
+                    verbose=verbose,
+                    log_file=out_dir / LOG_FILE_NAME,
+                    append=False,
+                )
+            else:
+                configure_logging(verbose=verbose)
+        elif save_to_disk:
             out_dir = _prepare_output_dir(output_dir)
-            configure_logging(
-                verbose=verbose,
-                log_file=out_dir / LOG_FILE_NAME,
-                append=False,
-            )
-        else:
-            configure_logging(verbose=verbose)
-    elif save_to_disk:
-        out_dir = _prepare_output_dir(output_dir)
+    except OSError as exc:
+        logger.error(
+            "sshtemp.output_write_error",
+            extra=_log_extra(log_id=log_id, error=str(exc)),
+        )
+        if manage_logging:
+            shutdown_logging()
+        return SshTempResult(
+            success=False,
+            output_dir=out_dir,
+            log_id=log_id,
+            error=_format_write_error(exc),
+        )
 
     validation = validate_template(template_text, directive_prefix=directive_prefix)
     if not validation.valid:
@@ -868,6 +1197,7 @@ def ssht(
             extra=_log_extra(log_id=context.log_id, error=warning),
         )
     captures: dict[str, str] = {}
+    unnamed_capture_index = 0
 
     try:
         for item in _ssh_temp(
@@ -876,7 +1206,9 @@ def ssht(
             context=context,
             skip_validation=True,
         ):
-            name = item.name.strip() or f"capture_{len(captures)}.txt"
+            name, unnamed_capture_index = _assign_capture_name(
+                item.name, unnamed_capture_index
+            )
             if save_to_disk:
                 file_path = _resolve_capture_path(out_dir, name)
                 _append_capture_file(file_path, item.output)
@@ -891,6 +1223,13 @@ def ssht(
             warnings=list(context.warnings),
         )
     except SshTempError as exc:
+        unnamed_capture_index = _commit_partial_capture(
+            context,
+            captures,
+            unnamed_capture_index,
+            save_to_disk=save_to_disk,
+            out_dir=out_dir,
+        )
         result = SshTempResult(
             success=False,
             output_dir=out_dir,
@@ -904,6 +1243,13 @@ def ssht(
             failed_capture_name=exc.capture_name,
         )
     except ValueError as exc:
+        unnamed_capture_index = _commit_partial_capture(
+            context,
+            captures,
+            unnamed_capture_index,
+            save_to_disk=save_to_disk,
+            out_dir=out_dir,
+        )
         result = SshTempResult(
             success=False,
             output_dir=out_dir,
@@ -912,6 +1258,31 @@ def ssht(
             captures=captures,
             warnings=list(context.warnings),
             error=str(exc),
+        )
+    except OSError as exc:
+        unnamed_capture_index = _commit_partial_capture(
+            context,
+            captures,
+            unnamed_capture_index,
+            save_to_disk=save_to_disk,
+            out_dir=out_dir,
+        )
+        logger.error(
+            "sshtemp.output_write_error",
+            extra=_log_extra(
+                context.host,
+                log_id=context.log_id,
+                error=str(exc),
+            ),
+        )
+        result = SshTempResult(
+            success=False,
+            output_dir=out_dir,
+            host=context.host,
+            log_id=context.log_id,
+            captures=captures,
+            warnings=list(context.warnings),
+            error=_format_write_error(exc),
         )
 
     if manage_logging and save_to_disk:

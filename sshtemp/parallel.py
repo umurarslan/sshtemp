@@ -7,6 +7,7 @@ from pathlib import Path
 
 from sshtemp.engine import (
     DEFAULT_HOST_KEY_POLICY,
+    _format_write_error,
     _prepare_output_dir,
     _resolve_template_text,
     ssht,
@@ -74,15 +75,22 @@ def ssht_parallel(
 
     out_dir: Path | None = None
     try:
-        if save_to_disk:
-            out_dir = _prepare_output_dir(output_dir)
-            configure_logging(
-                verbose=verbose,
-                log_file=out_dir / LOG_FILE_NAME,
-                append=False,
+        try:
+            if save_to_disk:
+                out_dir = _prepare_output_dir(output_dir)
+                configure_logging(
+                    verbose=verbose,
+                    log_file=out_dir / LOG_FILE_NAME,
+                    append=False,
+                )
+            else:
+                configure_logging(verbose=verbose)
+        except OSError as exc:
+            return SshTempParallelResult(
+                success=False,
+                output_dir=out_dir,
+                error=_format_write_error(exc),
             )
-        else:
-            configure_logging(verbose=verbose)
 
         def run_section(section: str) -> SshTempResult:
             return ssht(

@@ -17,7 +17,7 @@ def main() -> None:
 
     sections = []
     for device in DEVICES:
-        sections.append(f"""
+        sections.append(rf"""
 _# --- {device} DEVICE CONNECTION ---
 _HOST: 172.29.112.112
 _USERNAME: clab

@@ -6,6 +6,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from sshtemp import __version__
 from sshtemp.cli import main
 from sshtemp.models import SshTempParallelResult, SshTempResult
 
@@ -16,12 +17,29 @@ class CliTests(unittest.TestCase):
             main([])
         self.assertEqual(ctx.exception.code, 2)
 
+    def test_version_exits_0(self):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), self.assertRaises(SystemExit) as ctx:
+            main(["--version"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn(__version__, stdout.getvalue())
+
     def test_missing_template_exits_1(self):
         stderr = io.StringIO()
         with redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
             main(["missing-template.txt"])
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("not found", stderr.getvalue())
+
+    def test_unreadable_template_exits_1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "bad.txt"
+            template.write_bytes(b"\xff\xfe")
+            stderr = io.StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+                main([str(template)])
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("failed to read template", stderr.getvalue())
 
     def test_check_valid_template_exits_0(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -379,6 +397,81 @@ class CliTests(unittest.TestCase):
                 main(["-p", "0", str(template)])
             self.assertEqual(ctx.exception.code, 1)
             self.assertIn("max_workers", stderr.getvalue())
+
+    @patch("sshtemp.cli.ssht_parallel")
+    def test_parallel_failure_prints_all_sections(self, mock_ssht_parallel):
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "ok.txt"
+            template.write_text(
+                "_HOST: 10.0.0.1\n_USERNAME: admin\n",
+                encoding="utf-8",
+            )
+            mock_ssht_parallel.return_value = SshTempParallelResult(
+                success=False,
+                failed_section_index=0,
+                error="section 1 failed: timeout",
+                results=[
+                    SshTempResult(
+                        success=False,
+                        host="10.0.0.1",
+                        error="timeout",
+                        captures={"partial.txt": "first"},
+                    ),
+                    SshTempResult(
+                        success=True,
+                        host="10.0.0.2",
+                    ),
+                    SshTempResult(
+                        success=False,
+                        log_id="device-c",
+                        error="refused",
+                        failed_line=4,
+                        failed_command="show version",
+                    ),
+                ],
+            )
+
+            stderr = io.StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+                main(["-p", "3", str(template)])
+            self.assertEqual(ctx.exception.code, 1)
+            output = stderr.getvalue()
+            self.assertIn("10.0.0.1: partial captures (1): partial.txt", output)
+            self.assertIn("10.0.0.1: timeout", output)
+            self.assertIn("device-c: failed at line 4; command 'show version'", output)
+            self.assertIn("device-c: refused", output)
+            self.assertIn("section 1 failed: timeout", output)
+            self.assertNotIn("10.0.0.2:", output)
+
+    @patch("sshtemp.cli.ssht_parallel")
+    def test_parallel_failure_section_label_is_one_based(self, mock_ssht_parallel):
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "ok.txt"
+            template.write_text(
+                "_HOST: 10.0.0.1\n_USERNAME: admin\n",
+                encoding="utf-8",
+            )
+            mock_ssht_parallel.return_value = SshTempParallelResult(
+                success=False,
+                failed_section_index=0,
+                error="section 1 failed: timeout",
+                results=[
+                    SshTempResult(
+                        success=False,
+                        error="timeout",
+                        warnings=["error pattern matched"],
+                    ),
+                ],
+            )
+
+            stderr = io.StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+                main(["-p", "1", str(template)])
+            self.assertEqual(ctx.exception.code, 1)
+            output = stderr.getvalue()
+            self.assertIn("[section 1] warning:", output)
+            self.assertIn("section 1: timeout", output)
+            self.assertNotIn("section 0", output)
 
 
 if __name__ == "__main__":

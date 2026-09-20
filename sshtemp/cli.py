@@ -2,8 +2,10 @@ import argparse
 import sys
 from pathlib import Path
 
-from sshtemp.engine import ssht
+from sshtemp import __version__
+from sshtemp.engine import _resolve_template_text, ssht
 from sshtemp.env_subst import substitute_env_vars
+from sshtemp.models import SshTempParallelResult, SshTempResult
 from sshtemp.parallel import ssht_parallel
 from sshtemp.validator import validate_template
 
@@ -13,7 +15,15 @@ def _print_warnings(warnings: list[str]) -> None:
         print(f"warning: {warning}", file=sys.stderr)
 
 
-def _format_failure_location(result) -> str | None:
+def _parallel_section_label(index: int, section_result: SshTempResult) -> str:
+    return (
+        section_result.log_id
+        or section_result.host
+        or f"section {index + 1}"
+    )
+
+
+def _format_failure_location(result: SshTempResult) -> str | None:
     parts: list[str] = []
     if result.failed_line is not None:
         parts.append(f"line {result.failed_line}")
@@ -26,7 +36,7 @@ def _format_failure_location(result) -> str | None:
     return "failed at " + "; ".join(parts)
 
 
-def _emit_run_result(result) -> int:
+def _emit_run_result(result: SshTempResult) -> int:
     if result.warnings:
         print(f"{len(result.warnings)} warning(s):", file=sys.stderr)
         _print_warnings(result.warnings)
@@ -49,16 +59,12 @@ def _emit_run_result(result) -> int:
     return 1
 
 
-def _emit_parallel_run_result(result) -> int:
+def _emit_parallel_run_result(result: SshTempParallelResult) -> int:
     warning_lines: list[str] = []
     for index, section_result in enumerate(result.results):
         if not section_result.warnings:
             continue
-        label = (
-            section_result.log_id
-            or section_result.host
-            or f"section {index}"
-        )
+        label = _parallel_section_label(index, section_result)
         for warning in section_result.warnings:
             warning_lines.append(f"[{label}] warning: {warning}")
     if warning_lines:
@@ -73,18 +79,21 @@ def _emit_parallel_run_result(result) -> int:
 
     if result.output_dir is not None:
         print(f"output: {result.output_dir}", file=sys.stderr)
-    if result.failed_section_index is not None and result.results:
-        failed = result.results[result.failed_section_index]
-        label = (
-            failed.log_id
-            or failed.host
-            or f"section {result.failed_section_index}"
-        )
-        failure_location = _format_failure_location(failed)
+    for index, section_result in enumerate(result.results):
+        if section_result.success:
+            continue
+        label = _parallel_section_label(index, section_result)
+        if section_result.captures:
+            names = ", ".join(sorted(section_result.captures))
+            print(
+                f"{label}: partial captures ({len(section_result.captures)}): {names}",
+                file=sys.stderr,
+            )
+        failure_location = _format_failure_location(section_result)
         if failure_location:
             print(f"{label}: {failure_location}", file=sys.stderr)
-        if failed.error:
-            print(f"{label}: {failed.error}", file=sys.stderr)
+        if section_result.error:
+            print(f"{label}: {section_result.error}", file=sys.stderr)
     print(result.error or "run failed", file=sys.stderr)
     return 1
 
@@ -94,12 +103,17 @@ def main(argv: list[str] | None = None) -> None:
         prog="sshtemp",
         description="Run an SSH template file and write captures to an output folder.",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
     parser.add_argument("template", nargs="?", help="Path to the template file")
     parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
-        help="Log INFO events (commands, captures, expect details)",
+        help="Log INFO events (commands, captures, expect / if-then details)",
     )
     parser.add_argument(
         "-o",
@@ -110,7 +124,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Validate template syntax only (no SSH, no ${VAR} substitution)",
+        help="Validate sequential template syntax only (no SSH, no ${VAR} substitution)",
     )
     parser.add_argument(
         "--host-key-policy",
@@ -133,12 +147,10 @@ def main(argv: list[str] | None = None) -> None:
         parser.print_usage(sys.stderr)
         sys.exit(2)
 
-    template_path = Path(args.template)
-    if not template_path.is_file():
-        print(f"template file not found: {template_path}", file=sys.stderr)
+    template_text, load_error = _resolve_template_text(Path(args.template))
+    if load_error:
+        print(load_error, file=sys.stderr)
         sys.exit(1)
-
-    template_text = template_path.read_text(encoding="utf-8")
 
     if args.check:
         validation = validate_template(template_text)
