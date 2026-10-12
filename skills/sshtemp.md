@@ -1,6 +1,9 @@
 # sshtemp — instructions for AI assistants
 
-Follow this file when writing or editing **sshtemp** templates (`ssht()`, `ssht_parallel()`, `sshtemp` CLI). Human docs: `README.md`. Example templates: `examples/`.
+Follow this file when writing or editing **sshtemp** templates (`ssht()`, `ssht_parallel()`, `sshtemp` CLI).
+
+Source: https://github.com/umurarslan/sshtemp
+Human docs: `README.md` in that repository. Example templates: `examples/`.
 
 Copy this file into any project that uses sshtemp, or tell the assistant to follow it.
 
@@ -77,7 +80,7 @@ else:
     print(result.error)
 ```
 
-- CLI always writes `output_*/`. Python writes files only if `save_to_disk=True`.
+- CLI writes `output_*/` for a run. `--check`, an unreadable template, a missing `${VAR}`, and a parallel prep error do not. Python writes files only if `save_to_disk=True`.
 - Default `host_key_policy` is `auto` (Paramiko `_HOST` only). Nested `ssh` options are the template’s problem.
 - `ssht_parallel(template, max_workers, ...)` — required `max_workers >= 1`. No `log_id` (use `_LOGID:` per section). No merged capture dict.
 

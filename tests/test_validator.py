@@ -51,6 +51,89 @@ show version
         self.assertFalse(result.valid)
         self.assertTrue(any("_USERNAME" in issue for issue in result.issues))
 
+    def test_command_before_later_connect_settings_is_invalid(self):
+        template = "show version\n_HOST: 10.0.0.1\n_USERNAME: admin\n_EXPECT: #\\s*$\n"
+        result = validate_template(template)
+        self.assertFalse(result.valid)
+        self.assertTrue(
+            any("line 1:" in issue and "_HOST" in issue for issue in result.issues)
+        )
+        self.assertTrue(
+            any(
+                "line 1:" in issue and "_USERNAME" in issue
+                for issue in result.issues
+            )
+        )
+
+    def test_each_early_command_reports_missing_host(self):
+        template = (
+            "show version\n"
+            "show port\n"
+            "_HOST: 10.0.0.1\n"
+            "_USERNAME: admin\n"
+            "_EXPECT: #\\s*$\n"
+        )
+        result = validate_template(template)
+        self.assertFalse(result.valid)
+        self.assertTrue(
+            any("line 1:" in issue and "_HOST" in issue for issue in result.issues)
+        )
+        self.assertTrue(
+            any("line 2:" in issue and "_HOST" in issue for issue in result.issues)
+        )
+
+    def test_empty_host_before_command_is_invalid(self):
+        template = "_HOST:\n_USERNAME: admin\n_EXPECT: #\\s*$\nshow version\n"
+        result = validate_template(template)
+        self.assertFalse(result.valid)
+        self.assertTrue(
+            any("line 4:" in issue and "_HOST" in issue for issue in result.issues)
+        )
+
+    def test_command_before_expect_warns_once(self):
+        template = (
+            "_HOST: 10.0.0.1\n"
+            "_USERNAME: admin\n"
+            "show version\n"
+            "_EXPECT: #\\s*$\n"
+            "show port\n"
+        )
+        result = validate_template(template)
+        self.assertTrue(result.valid)
+        self.assertEqual(result.issues, [])
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("line 3:", result.warnings[0])
+        self.assertIn("_EXPECT", result.warnings[0])
+
+    def test_cleared_expect_warns_for_the_next_command(self):
+        template = (
+            "_HOST: 10.0.0.1\n"
+            "_USERNAME: admin\n"
+            "_EXPECT: #\\s*$\n"
+            "show version\n"
+            "_EXPECT:\n"
+            "show port\n"
+        )
+        result = validate_template(template)
+        self.assertTrue(result.valid)
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("line 6:", result.warnings[0])
+        self.assertIn("_EXPECT", result.warnings[0])
+
+    def test_enter_before_host_is_invalid(self):
+        template = "_ENTER\n_HOST: 10.0.0.1\n_USERNAME: admin\n_EXPECT: #\n"
+        result = validate_template(template)
+        self.assertFalse(result.valid)
+        self.assertTrue(
+            any("line 1:" in issue and "_HOST" in issue for issue in result.issues)
+        )
+        self.assertTrue(
+            any(
+                "line 1:" in issue and "_USERNAME" in issue
+                for issue in result.issues
+            )
+        )
+
     def test_unknown_directive(self):
         template = """
 _HOST: 10.0.0.1

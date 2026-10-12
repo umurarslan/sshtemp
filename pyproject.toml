@@ -1,6 +1,6 @@
 [project]
 name = "sshtemp"
-version = "2026.9.1"
+version = "2026.10.12"
 description = "Template-driven SSH automation using Paramiko invoke_shell"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -22,6 +22,10 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 
+[project.urls]
+Homepage = "https://github.com/umurarslan/sshtemp"
+Source = "https://github.com/umurarslan/sshtemp"
+
 [project.scripts]
 sshtemp = "sshtemp.cli:main"
 
@@ -31,3 +35,4 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["sshtemp"]
+

@@ -493,7 +493,6 @@ def _ssh_temp(
     error_pattern = ""
     error_fail = "off"
     capture_name = ""
-    capture_leading_enter = False
     shell_width = DEFAULT_SHELL_WIDTH
     shell_height = DEFAULT_SHELL_HEIGHT
     login_settle_seconds = LOGIN_SETTLE_SECONDS
@@ -681,7 +680,6 @@ def _ssh_temp(
                     capture_block_retry = pending_retry
                     pending_retry = None
                 capturing = True
-                capture_leading_enter = True
                 capture_name = raw.strip()
                 continue
             elif name == "END":
@@ -787,10 +785,6 @@ def _ssh_temp(
                     ),
                 )
 
-            if capture_leading_enter:
-                line = "\n" + line
-                capture_leading_enter = False
-
             if pending_if is not None:
                 raise SshTempTemplateError(
                     f"missing {directive_prefix}THEN for {directive_prefix}IF at line {line_number}",
@@ -827,10 +821,22 @@ def _ssh_temp(
                     recv_encoding=recv_encoding,
                 )
                 recv_text = outcome.recv_text
-                if capturing:
+                expect_matched = bool(
+                    expect_pattern and re.search(expect_pattern, recv_text)
+                )
+                # A retry re-sends the line, so keep only the attempt that is
+                # accepted or that ends the command. Earlier misses stay in
+                # the retry log, not in the capture.
+                retrying = bool(
+                    expect_pattern
+                    and not expect_matched
+                    and not outcome.channel_closed
+                    and attempts_left > 0
+                )
+                if capturing and not retrying:
                     capture_buffer += recv_text
 
-                if expect_pattern and re.search(expect_pattern, recv_text):
+                if expect_matched:
                     break
 
                 if outcome.channel_closed:
@@ -957,7 +963,7 @@ def _ssh_temp(
 
 
 def _default_output_dir() -> Path:
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     return Path(f"output_{stamp}")
 
 

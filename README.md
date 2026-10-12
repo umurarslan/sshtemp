@@ -4,7 +4,9 @@ Template-driven SSH automation using Paramiko `invoke_shell`. Built for **networ
 
 Requires **Python 3.11+**.
 
-AI assistants writing templates: follow [`AGENTS.md`](AGENTS.md).
+Source: https://github.com/umurarslan/sshtemp
+
+AI assistants writing templates: follow [`skills/sshtemp.md`](skills/sshtemp.md).
 
 ```bash
 pip install sshtemp
@@ -36,7 +38,7 @@ for warning in result.warnings:
 
 `ssht()` **never raises**. Check `result.success`, then `result.error` / `result.warnings`, then `result.captures`. Pass `save_to_disk=True` to write capture files and `sshtemp.log` under `result.output_dir`.
 
-CLI (always writes an output folder; `${VAR}` in `.txt` files is filled from the environment, or prompted if missing):
+CLI writes an output folder for a run. `${VAR}` in `.txt` files is filled from the environment, or prompted if missing:
 
 ```bash
 sshtemp my_template.txt
@@ -54,7 +56,7 @@ Full flags, result fields, and the template language: [Advanced](#advanced).
 
 ## Examples
 
-Lab IPs and passwords — adapt them. These files are in the git repository (`examples/`), not in the pip package.
+Lab IPs and passwords — adapt them. These files are in the repository [`examples/`](examples/), not in the pip package.
 
 | Level | Python | CLI |
 | --- | --- | --- |
@@ -111,7 +113,7 @@ sshtemp --check my_template.txt
 
 `--check` does **not** split on `_HOST:` or inject sticky settings. A file can pass `--check` and still fail `sshtemp -p N`. If both `--check` and `-p` are set, **only `--check` runs**.
 
-Exit `0` prints `output: <path>` on stdout. Warnings and failures go to stderr (partial capture names, failed line when available; for `-p`, each failed section then a summary of the first failure). Without `-o`, the CLI creates `output_YYYYMMDD-HHMMSS/` in the current directory. Repeated capture names in one run are **appended**.
+Exit `0` prints `output: <path>` on stdout. Warnings and failures go to stderr (partial capture names, failed line number when available; for `-p`, each failed section then a summary of the first failure). Without `-o`, a run creates `output_YYYYMMDD-HHMMSS-ffffff/` in the current directory (`ffffff` is microseconds). `--check`, an unreadable template, a missing `${VAR}`, and a parallel prep error stop before that folder is created. Repeated capture names in one run are **appended**.
 
 ### API
 
@@ -135,11 +137,11 @@ ssht(
 | `verbose` | `False` | Log INFO events when `True` |
 | `directive_prefix` | `"_"` | Must not be empty |
 | `save_to_disk` | `False` | Write capture files and `sshtemp.log` |
-| `output_dir` | `None` | Folder when `save_to_disk=True`; default `output_YYYYMMDD-HHMMSS` |
+| `output_dir` | `None` | Folder when `save_to_disk=True`; default `output_YYYYMMDD-HHMMSS-ffffff` |
 | `host_key_policy` | `"auto"` | `auto` (accept unknown keys) or `reject` (system `known_hosts` only) |
 | `manage_logging` | `True` | `False` skips `configure_logging` / `shutdown_logging` (parallel workers) |
 
-A **multi-line** string is an inline template. A **single-line** string is a file path. Valid templates need at least two lines. `${VAR}` is **not** expanded by `ssht()` — see [Secrets](#secrets).
+A **multi-line** string is an inline template. A **single-line** string is a file path, so an inline template must contain a newline. `${VAR}` is **not** expanded by `ssht()` — see [Secrets](#secrets).
 
 **`ssht()` never raises.** Fatal problems set `result.success=False` and `result.error`. Exception classes in `sshtemp.exceptions` are internal.
 
@@ -154,6 +156,8 @@ result = validate_template(template_text)
 if not result.valid:
     for issue in result.issues:
         print(issue)
+for warning in result.warnings:
+    print(f"warning: {warning}")
 ```
 
 Takes **inline text**, not a file path. Same sequential checks as `sshtemp --check` (placeholders allowed; no parallel prep). Syntax problems are errors (`result.valid` is `False`). Missing `_EXPECT` is a **warning**. `--check` prints warnings to stderr and still exits `0` when syntax is valid. `ssht()` copies validation warnings into `result.warnings` before SSH starts.
@@ -173,7 +177,7 @@ Takes **inline text**, not a file path. Same sequential checks as `sshtemp --che
 | `output_dir` | Set when `save_to_disk=True` |
 | `host` | Last `_HOST:` (Paramiko target, not nested `ssh` targets) |
 | `log_id` | From `ssht(..., log_id=...)` or `_LOGID:` |
-| `failed_line` | Template line at failure; `None` if not applicable |
+| `failed_line` | 1-based template line number at failure; `None` if not applicable |
 | `failed_command` | Command at failure |
 | `failed_capture_name` | Active `_CAPTURE` name, or `None` |
 
@@ -266,7 +270,7 @@ admin display-config
 _END
 ```
 
-`_CAPTURE:name` sets the name (and file name under the output folder). `_CAPTURE` without a name uses `capture_0.txt`, `capture_1.txt`, …. Subfolders are allowed (`version/10.1.1.1.txt`). Absolute paths and `..` are rejected when writing files (not part of `--check`). Close every block before the next `_HOST:`. The first command in a block is sent with a leading newline.
+`_CAPTURE:name` sets the name (and file name under the output folder). `_CAPTURE` without a name uses `capture_0.txt`, `capture_1.txt`, …. Subfolders are allowed (`version/10.1.1.1.txt`). Absolute paths and `..` are rejected when writing files (not part of `--check`). Close every block before the next `_HOST:`.
 
 If the run fails before `_END`, output so far is still in `result.captures` (and on disk when `save_to_disk=True`) with a “saved partially” warning.
 
@@ -448,7 +452,7 @@ Workers share one log file when `save_to_disk=True`. Use unique capture names pe
 
 **Not injected:** `_LOGID`, `_ERROR` / `_ERRORFAIL`, `_WAIT` / `_RETRY`, `_IF` / `_THEN`. Wrap configure `_ERROR:` … `_ERROR:` in **each** section.
 
-Each section must have balanced `_CAPTURE` / `_END`. Content before the first `_HOST:` is a parallel-only error (`--check` does not catch it).
+Each section must have balanced `_CAPTURE` / `_END`. Blank lines and `_#` comments may appear before the first `_HOST:`. Any other content there is a parallel-only error (`--check` does not catch it).
 
 ### Troubleshooting
 

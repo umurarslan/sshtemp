@@ -250,6 +250,14 @@ show version
         self.assertFalse(result.success)
         self.assertIn("template validation failed", result.error or "")
 
+    def test_command_before_host_fails_before_connect(self):
+        template = "show version\n_HOST: 10.0.0.1\n_USERNAME: admin\n_EXPECT: #\n"
+        result = ssht(template)
+        self.assertFalse(result.success)
+        self.assertIn("template validation failed", result.error or "")
+        self.assertIn("line 1:", result.error or "")
+        self.assertIn("_HOST", result.error or "")
+
     def test_unknown_directive(self):
         template = """
 _HOST: 10.0.0.1
@@ -1066,6 +1074,38 @@ _END
         self.assertIn("show version", result.captures["out"])
 
     @patch("sshtemp.engine.paramiko.SSHClient")
+    def test_capture_commands_are_not_prefixed_with_a_newline(self, mock_ssh_client_cls):
+        session = _scripted_session(
+            b"TiMOS-C-21.10.R1\nA:host#\n",
+            b"exit all\n# Finished\nA:host#\n",
+        )
+        _wired_ssh(mock_ssh_client_cls, session)
+
+        template = r"""
+_HOST: 10.0.0.1
+_USERNAME: admin
+_EXPECT: #\s*$
+_CAPTURE:show_version
+show version
+_END
+_CAPTURE:config
+admin display-config
+_END
+"""
+
+        result = ssht(template)
+
+        self.assertTrue(result.success, result.error)
+        sent = [call.args[0] for call in session.send.call_args_list]
+        self.assertEqual(sent, ["show version\n", "admin display-config\n"])
+        show_version = result.captures["show_version"]
+        config = result.captures["config"]
+        self.assertIn("TiMOS-C-21.10.R1", show_version)
+        self.assertNotIn("admin display-config", show_version)
+        self.assertIn("# Finished", config)
+        self.assertNotIn("TiMOS-C-21.10.R1", config)
+
+    @patch("sshtemp.engine.paramiko.SSHClient")
     def test_if_then_response_sent(self, mock_ssh_client_cls):
         session = _scripted_session(b"Password:\n", b"Password:\nA:host#\n")
         _wired_ssh(mock_ssh_client_cls, session)
@@ -1137,6 +1177,68 @@ show version
 
         self.assertTrue(result.success)
         self.assertEqual(session.send.call_count, 2)
+
+    @patch("sshtemp.engine.paramiko.SSHClient")
+    def test_retry_capture_keeps_only_the_last_attempt(self, mock_ssh_client_cls):
+        _wired_ssh(
+            mock_ssh_client_cls,
+            _scripted_session(
+                b"show version\nok\nA:host#\n",
+                b"partial dump\n",
+                b"full dump\nA:host#\n",
+            ),
+        )
+
+        template = r"""
+_HOST: 10.0.0.1
+_USERNAME: admin
+_WAIT: 1
+_RETRY: 2
+_EXPECT: A:host#\s*$
+_CAPTURE:backup
+show version
+admin display-config
+_END
+"""
+
+        result = ssht(template)
+
+        self.assertTrue(result.success, result.error)
+        captured = result.captures["backup"]
+        self.assertIn("ok", captured)
+        self.assertIn("full dump", captured)
+        self.assertNotIn("partial dump", captured)
+
+    @patch("sshtemp.engine.paramiko.SSHClient")
+    def test_failed_retry_capture_keeps_only_the_last_attempt(self, mock_ssh_client_cls):
+        _wired_ssh(
+            mock_ssh_client_cls,
+            _scripted_session(
+                b"first partial\n",
+                b"second partial\n",
+            ),
+        )
+
+        template = r"""
+_HOST: 10.0.0.1
+_USERNAME: admin
+_WAIT: 1
+_RETRY: 2
+_EXPECT: A:host#\s*$
+_CAPTURE:backup
+admin display-config
+_END
+"""
+
+        result = ssht(template)
+
+        self.assertFalse(result.success)
+        captured = result.captures.get("backup", "")
+        self.assertIn("second partial", captured)
+        self.assertNotIn("first partial", captured)
+        self.assertTrue(
+            any("saved partially" in warning for warning in result.warnings)
+        )
 
     @patch("sshtemp.engine.paramiko.SSHClient")
     def test_wait_resets_after_command(self, mock_ssh_client_cls):
@@ -1328,7 +1430,9 @@ class SshtSaveToDiskTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("not found", result.error or "")
         self.assertIsNotNone(result.output_dir)
-        self.assertTrue(result.output_dir.name.startswith("output_"))
+        self.assertRegex(
+            result.output_dir.name, r"^output_\d{8}-\d{6}-\d{6}$"
+        )
         self.assertTrue((result.output_dir / "sshtemp.log").exists())
 
     def test_validation_failure(self):

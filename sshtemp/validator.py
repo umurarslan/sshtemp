@@ -126,9 +126,27 @@ def validate_template(
     pending_if = False
     capturing = False
     capture_name = ""
-    saw_command = False
     expect_pattern = ""
+    expect_warned = False
     error_pattern = ""
+
+    def _check_command_context(line_number: int) -> None:
+        nonlocal expect_warned
+        if not host_set:
+            issues.append(
+                f"line {line_number}: missing {directive_prefix}HOST before command"
+            )
+        if not username_set:
+            issues.append(
+                f"line {line_number}: missing {directive_prefix}USERNAME before command"
+            )
+        if not expect_pattern and not expect_warned:
+            warnings.append(
+                f"line {line_number}: no {directive_prefix}EXPECT set; each command "
+                f"waits up to {DEFAULT_WAIT_SECONDS}s "
+                f"(default {directive_prefix}WAIT) with no prompt detection"
+            )
+            expect_warned = True
 
     for line_number, line in enumerate(template_lines, start=1):
         if not line.strip():
@@ -268,6 +286,7 @@ def validate_template(
         if line.startswith(directive_prefix + "EXPECT:"):
             expect_pattern = line.removeprefix(directive_prefix + "EXPECT:").lstrip()
             if expect_pattern:
+                expect_warned = False
                 try:
                     re.compile(expect_pattern)
                 except re.error as exc:
@@ -359,6 +378,16 @@ def validate_template(
                 capture_name = ""
             continue
 
+        if name == "ENTER":
+            _check_command_context(line_number)
+            if pending_if:
+                issues.append(
+                    f"line {line_number}: {directive_prefix}IF without "
+                    f"{directive_prefix}THEN before command"
+                )
+                pending_if = False
+            continue
+
         if is_directive_line(line, directive_prefix):
             continue
 
@@ -366,7 +395,7 @@ def validate_template(
             issues.append(f"line {line_number}: unknown directive {line!r}")
             continue
 
-        saw_command = True
+        _check_command_context(line_number)
         if pending_if:
             issues.append(
                 f"line {line_number}: {directive_prefix}IF without "
@@ -379,16 +408,6 @@ def validate_template(
     if capturing:
         issues.append(
             f"unclosed {directive_prefix}CAPTURE block, missing {directive_prefix}END"
-        )
-    if saw_command and not host_set:
-        issues.append(f"missing {directive_prefix}HOST before commands")
-    if saw_command and not username_set:
-        issues.append(f"missing {directive_prefix}USERNAME before commands")
-    if saw_command and not expect_pattern:
-        warnings.append(
-            f"no {directive_prefix}EXPECT set; each command waits up to "
-            f"{DEFAULT_WAIT_SECONDS}s (default {directive_prefix}WAIT) with no "
-            "prompt detection"
         )
 
     return TemplateValidationResult(

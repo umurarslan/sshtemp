@@ -5,7 +5,7 @@ Public API: ``ssht()``, ``ssht_parallel()``, ``validate_template()``, and result
 classes live in ``sshtemp.exceptions`` for internal/advanced use.
 """
 
-__version__ = "2026.9.1"
+__version__ = "2026.10.12"
 
 from sshtemp.engine import ssht
 from sshtemp.models import (
@@ -25,3 +25,4 @@ __all__ = [
     "validate_template",
     "__version__",
 ]
+
